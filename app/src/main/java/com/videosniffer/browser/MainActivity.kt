@@ -28,6 +28,9 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicLong
 
@@ -60,6 +63,7 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
     private lateinit var countButton: Button
+    private lateinit var devToolsButton: Button
     private lateinit var manager: VideoDetectionManager
     private lateinit var history: HistoryStore
 
@@ -67,6 +71,10 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
     private var currentPageUrl = ""
     private var currentPageTitle = ""
     private var docStartInstalled = false
+
+    // F12 DevTools state: true = Eruda installed in the current page (panel
+    // opens/closes on tap). Reset whenever the WebView is destroyed.
+    private var devToolsEnabled = false
 
     @Volatile
     private var browserUserAgent = ""
@@ -186,16 +194,20 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
         )
 
         // ---- bottom bar ----
+        // Back button hataya gaya hai; uski jagah F12 (DevTools) button hai.
+        // Page ke andar wapas jaane ke liye system back kaam karta hai.
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val back = Button(this).apply {
-            text = "\u2039"
-            contentDescription = "Back"
-            setOnClickListener { goBackOrHome() }
+        val devTools = Button(this).apply {
+            text = "F12"
+            contentDescription = "Developer Tools (F12)"
+            setTextColor(Color.rgb(28, 30, 38))
+            setOnClickListener { toggleDevTools() }
         }
+        devToolsButton = devTools
 
         val home = Button(this).apply {
             text = "Home"
@@ -230,7 +242,7 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
             setOnClickListener { if (!isHome) webView?.reload() }
         }
 
-        bottom.addView(back, LinearLayout.LayoutParams(0, dp(46), 0.7f))
+        bottom.addView(devTools, LinearLayout.LayoutParams(0, dp(46), 0.7f))
         bottom.addView(home, LinearLayout.LayoutParams(0, dp(46), 1f))
         bottom.addView(countButton, LinearLayout.LayoutParams(0, dp(46), 1.3f))
         bottom.addView(historyButton, LinearLayout.LayoutParams(0, dp(46), 1.1f))
@@ -352,6 +364,10 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
         status.text = DEFAULT_STATUS
         countButton.text = "Links (0)"
 
+        // DevTools state reset (WebView destroy ho chuka hai).
+        devToolsEnabled = false
+        devToolsButton.setTextColor(Color.rgb(28, 30, 38))
+
         hideKeyboard(homeInput)
         homeInput.clearFocus()
     }
@@ -360,15 +376,6 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
         isHome = false
         homeView.visibility = View.GONE
         addressRow.visibility = View.VISIBLE
-    }
-
-    private fun goBackOrHome() {
-        val wv = webView
-        if (!isHome && wv != null && wv.canGoBack()) {
-            wv.goBack()
-        } else if (!isHome) {
-            showHome()
-        }
     }
 
     private fun destroyWebView() {
@@ -595,6 +602,10 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
                 }
 
                 injectSniffer(view)
+
+                // DevTools enabled hai to naye document par dobara install karo
+                // (navigation se purana Eruda instance khatam ho jata hai).
+                if (devToolsEnabled) installDevToolsAfterPageLoad(view)
             }
         }
     }
@@ -603,6 +614,134 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
     private fun injectSniffer(view: WebView?) {
         if (docStartInstalled) return
         view?.evaluateJavascript(SnifferScript.JS, null)
+    }
+
+    // ------------------------------------------------------------------ DevTools (F12)
+
+    /**
+     * F12 button behaviour (PC-browser style):
+     *  - DevTools off  -> Eruda download (ya cache) + install + panel open.
+     *  - DevTools on   -> panel open/close toggle.
+     */
+    private fun toggleDevTools() {
+        val wv = webView
+        if (isHome || wv == null) {
+            status.text =
+                "F12 DevTools ke liye pehle koi website kholo."
+            return
+        }
+
+        if (!devToolsEnabled) {
+            status.text = "DevTools load ho raha hai..."
+            ensureErudaSource { source ->
+                val live = webView
+                if (live == null) {
+                    devToolsEnabled = false
+                    return@ensureErudaSource
+                }
+
+                if (source != null) {
+                    devToolsEnabled = true
+                    devToolsButton.setTextColor(Color.rgb(75, 65, 130))
+                    live.evaluateJavascript(source, null)
+                    live.evaluateJavascript(DevToolsScript.INIT_AND_SHOW_JS, null)
+                    status.text =
+                        "DevTools ON - Console, Elements, Network, Resources, Info (PC F12 jaisa)."
+                } else {
+                    // App-level download fail hua: page ke andar se CDN loader try karo.
+                    live.evaluateJavascript(DevToolsScript.CDN_LOADER_JS, null)
+                    status.text =
+                        "DevTools download nahi hua - page-level CDN loader try kar rahe hain."
+                }
+            }
+        } else {
+            wv.evaluateJavascript(DevToolsScript.TOGGLE_JS, null)
+        }
+    }
+
+    /**
+     * Page navigation ke baad DevTools dobara install karo (naya document =
+     * purana Eruda instance khatam). Panel auto-open nahi hota; F12 tap se
+     * khulega. Eruda chaalu rehta hai to Console/Network capture karti hai.
+     */
+    private fun installDevToolsAfterPageLoad(wv: WebView?) {
+        if (wv == null) return
+        ensureErudaSource { source ->
+            val live = webView
+            if (live == null) return@ensureErudaSource
+
+            if (source != null) {
+                live.evaluateJavascript(source, null)
+                live.evaluateJavascript(DevToolsScript.INIT_JS, null)
+            } else {
+                live.evaluateJavascript(DevToolsScript.CDN_LOADER_JS, null)
+            }
+        }
+    }
+
+    /**
+     * Eruda source nikalo (background thread): memory cache -> disk cache ->
+     * CDN download. Pehli successful download ke baad DevTools offline bhi
+     * chalta hai. Result UI thread par wapas aata hai.
+     */
+    private fun ensureErudaSource(onResult: (String?) -> Unit) {
+        DevToolsScript.cachedSource?.let {
+            onResult(it)
+            return
+        }
+
+        Thread {
+            var result: String? = null
+
+            // 1) Disk cache (pichli baar download hua hoga).
+            try {
+                val cacheFile = File(cacheDir, "eruda.min.js")
+                if (cacheFile.exists() &&
+                    cacheFile.length() > DevToolsScript.MIN_SOURCE_LENGTH
+                ) {
+                    val text = cacheFile.readText()
+                    if (text.length > DevToolsScript.MIN_SOURCE_LENGTH &&
+                        text.contains("eruda")
+                    ) {
+                        DevToolsScript.cachedSource = text
+                        result = text
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+
+            // 2) Network download (pehli baar). Teeno CDN try karo.
+            if (result == null) {
+                for (url in DevToolsScript.CDN_URLS) {
+                    try {
+                        val conn =
+                            URL(url).openConnection() as HttpURLConnection
+                        conn.connectTimeout = 8000
+                        conn.readTimeout = 15000
+                        conn.instanceFollowRedirects = true
+                        try {
+                            val text = conn.inputStream.bufferedReader().use {
+                                it.readText()
+                            }
+                            if (text.length > DevToolsScript.MIN_SOURCE_LENGTH &&
+                                text.contains("eruda")
+                            ) {
+                                val cacheFile = File(cacheDir, "eruda.min.js")
+                                cacheFile.writeText(text)
+                                DevToolsScript.cachedSource = text
+                                result = text
+                            }
+                        } finally {
+                            conn.disconnect()
+                        }
+                        if (result != null) break
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+
+            runOnUiThread { onResult(result) }
+        }.start()
     }
 
     /**
