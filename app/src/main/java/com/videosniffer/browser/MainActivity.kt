@@ -62,6 +62,7 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
     private lateinit var countButton: Button
     private lateinit var manager: VideoDetectionManager
     private lateinit var history: HistoryStore
+    private lateinit var devTools: DevToolsPanel
 
     private var isHome = true
     private var currentPageUrl = ""
@@ -180,21 +181,30 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
             FrameLayout.LayoutParams(-1, -1)
         )
 
+        // F12 DevTools overlay lives inside the content frame (slides over the page).
+        devTools = DevToolsPanel(
+            this,
+            content,
+            webViewProvider = { webView },
+            pageUrlProvider = { currentPageUrl },
+            userAgentProvider = { browserUserAgent }
+        )
+
         root.addView(
             content,
             LinearLayout.LayoutParams(-1, 0, 1f)
         )
 
-        // ---- bottom bar ----
+        // ---- bottom bar: F12 | Home | Links | History | Reload ----
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val back = Button(this).apply {
-            text = "\u2039"
-            contentDescription = "Back"
-            setOnClickListener { goBackOrHome() }
+        val f12 = Button(this).apply {
+            text = "F12"
+            contentDescription = "Developer Tools (F12)"
+            setOnClickListener { devTools.toggle() }
         }
 
         val home = Button(this).apply {
@@ -230,7 +240,7 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
             setOnClickListener { if (!isHome) webView?.reload() }
         }
 
-        bottom.addView(back, LinearLayout.LayoutParams(0, dp(46), 0.7f))
+        bottom.addView(f12, LinearLayout.LayoutParams(0, dp(46), 0.7f))
         bottom.addView(home, LinearLayout.LayoutParams(0, dp(46), 1f))
         bottom.addView(countButton, LinearLayout.LayoutParams(0, dp(46), 1.3f))
         bottom.addView(historyButton, LinearLayout.LayoutParams(0, dp(46), 1.1f))
@@ -336,6 +346,9 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
     private fun showHome() {
         isHome = true
 
+        // DevTools kaam ka panel hai: Home par hamesha band karo.
+        devTools.close()
+
         destroyWebView()
 
         // Naye page se pehle purane links saaf.
@@ -362,21 +375,13 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
         addressRow.visibility = View.VISIBLE
     }
 
-    private fun goBackOrHome() {
-        val wv = webView
-        if (!isHome && wv != null && wv.canGoBack()) {
-            wv.goBack()
-        } else if (!isHome) {
-            showHome()
-        }
-    }
-
     private fun destroyWebView() {
         val wv = webView ?: return
         webView = null
         try {
             wv.stopLoading()
             wv.removeJavascriptInterface("VideoSnifferBridge")
+            wv.removeJavascriptInterface("VideoSnifferDevBridge")
             content.removeView(wv)
             wv.destroy()
         } catch (_: Throwable) {
@@ -457,16 +462,23 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
             "VideoSnifferBridge"
         )
 
+        // DevTools ka JS bridge: console logs + async view-source yahan se aate hain.
+        wv.addJavascriptInterface(
+            DevToolsBridge(),
+            "VideoSnifferDevBridge"
+        )
+
         // Iframe players (embedded video sites) need third-party cookies.
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-        // Inject the sniffer at document start in ALL frames (main page + iframes).
+        // Inject the sniffer + devtools console hook at document start in ALL frames
+        // (main page + iframes).
         docStartInstalled = false
         try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 WebViewCompat.addDocumentStartJavaScript(
                     wv,
-                    SnifferScript.JS,
+                    arrayOf(SnifferScript.JS, DevToolsConsoleScript.JS),
                     setOf("*")
                 )
                 docStartInstalled = true
@@ -543,6 +555,13 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
                         currentPageTitle,
                         browserUserAgent
                     )
+
+                    // F12 Network tab ke liye har request log karo.
+                    devTools.onNetworkRequest(
+                        request?.method ?: "GET",
+                        url,
+                        request?.requestHeaders
+                    )
                 }
 
                 return super.shouldInterceptRequest(view, request)
@@ -561,6 +580,9 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
                 // Naya page shuru: purane page ke links hata do (Kitty Browser jaisa).
                 manager.clear(tabId)
 
+                // Network log bhi naye page ke liye reset (console preserved rehta hai).
+                devTools.onNewPage()
+
                 injectSniffer(view)
             }
 
@@ -576,6 +598,8 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
                         currentPageTitle,
                         browserUserAgent
                     )
+
+                    devTools.onNetworkRequest("GET", url, null)
                 }
             }
 
@@ -602,7 +626,10 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
     /** Fallback for old WebViews without DOCUMENT_START_SCRIPT (main frame only). */
     private fun injectSniffer(view: WebView?) {
         if (docStartInstalled) return
-        view?.evaluateJavascript(SnifferScript.JS, null)
+        view?.evaluateJavascript(
+            SnifferScript.JS + "\n" + DevToolsConsoleScript.JS,
+            null
+        )
     }
 
     /**
@@ -627,6 +654,14 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
                                 currentPageTitle,
                                 browserUserAgent
                             )
+
+                            if (activeTabId == tabId) {
+                                devTools.onNetworkRequest(
+                                    request?.method ?: "GET",
+                                    url,
+                                    request?.requestHeaders
+                                )
+                            }
                         }
                         return null
                     }
@@ -685,6 +720,25 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
         }
     }
 
+    /**
+     * JS bridge for the F12 DevTools panel. The page-side hook (DevToolsConsoleScript)
+     * queues console output here, and the async view-source fetch reports through onSource.
+     */
+    private inner class DevToolsBridge {
+
+        @JavascriptInterface
+        fun onConsole(level: String?, message: String?) {
+            devTools.onConsoleMessage(level ?: "log", message ?: "")
+        }
+
+        @JavascriptInterface
+        fun onSource(text: String?) {
+            runOnUiThread {
+                devTools.onPageSource(text ?: "")
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ callbacks
 
     override fun onMediaDetected(media: DetectedMedia) {
@@ -723,6 +777,9 @@ class MainActivity : Activity(), VideoDetectionManager.Listener {
     override fun onBackPressed() {
         val wv = webView
         when {
+            // F12 panel khula ho to pehle use band karo (PC jaisa Esc behaviour).
+            devTools.isOpen -> devTools.close()
+
             !isHome && wv != null && wv.canGoBack() -> wv.goBack()
             !isHome -> showHome()
             else -> super.onBackPressed()
